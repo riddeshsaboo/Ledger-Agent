@@ -14,8 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 BASE_URL = (
     "https://exam.sanand.workers.dev/questionData"
-    "?email=24f3001311%40ds.study.iitm.ac.in"
-    "&quizSign=qaDMHhDfPMnBJcU%2BFeBuxXtwY7xWzn3xG%2F3dOYEufQcegy95Ub5yeb2%2FcMsgy1taz0jK9uOI9%2FLP49TGZHoOvo04ZWv7CpLwoYiKXSq4h1nBHTQfKO1%2BtDiuqYcmj%2B6wrkOl80aCLFD9B6R7n2PScSGSOeOMsUWcrlzyq0qZ0gSLHMT%2BUpendMsv3NCJy%2FATctMHijhyYtfQpmXa4tQicu9XC3%2FjXGTt4G1OYjw6VOEZCdv3a948waETDJTLl164m6ZyTKd2KU16ha1kCflXNERb4Lpfx66566JYAKaXe0zSgFP0xS9Xl%2FP1ENC0C8qiB1vagsgvfENaUfLkKf0m7w%3D%3D"
+    "?email=24f1001102%40ds.study.iitm.ac.in"
+    "&quizSign=clw75oeT32Y%2F4vjsRdp7nJPUhe9UMsSFCLWcA7IvMDPAJQ4MqFJ58z%2B%2FEJm7Dvw64BDc%2FNAIeInt8KXf0nLT9WJRJigoASrBjVhYlDTnpjhgZZMnwII25IrhXBxFUC%2BrUHO5hjoUuenb94Bs7xsOUnS3uGcMJKJcF%2FUfW4l%2FcXK2JM5z0oaq%2Bd%2FhEz1rLNBtu4oOq2U8J1frIpxSeMJ1bmgaUqWAL%2BmVhPl542wgpyOB%2BbFgDB8KSOt3zC4G8Iaft%2FQlzSISQMuBv6imDy78oikHUaAv5jNoDBfLygIkv5MJVs24XSerrEtgGDz1iXPiD%2Bb0tR%2Bx5KgQfBkJ3MH9SA%3D%3D"
     "&questionId=q-ledger-agent-server"
 )
 RATES_URL = BASE_URL + "&path=%2Frates"
@@ -173,17 +173,20 @@ def make_plan(question):
         "top selling product", "best-selling product", "best selling product",
         "product earned the most", "product generated the most",
         "highest revenue product", "highest-revenue product",
-        "most revenue product", "product sold the most",
+        "most revenue product", "product sold the most", "product with the highest",
+        "which product had the highest", "which product generated the highest",
+        "product with most revenue", "highest-selling product",
     ))
     customer_rank = any(s in q for s in (
         "which customer", "what customer", "top customer",
         "customer spent the most", "customer spending the most",
-        "highest spending customer", "biggest spender",
+        "highest spending customer", "biggest spender", "customer with the highest",
+        "customer with most spending", "who spent the most",
     ))
     region_rank = any(s in q for s in (
         "which region", "what region", "top region",
         "region earned the most", "region generated the most",
-        "highest revenue region",
+        "highest revenue region", "region with the highest", "region with most revenue",
     ))
     revenue_words = any(s in q for s in (
         "revenue", "earned", "earnings", "sales value", "in usd",
@@ -240,21 +243,27 @@ def make_plan(question):
         or re.search(r"\bnumber of customers?\b", q)):
         return f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where}", params, "int"
 
-    # Count intent: "how many" means a count only when it is not an
-    # average/value question. This handles "Count the refunded West orders".
+    # Quantity questions must be checked before generic "how many" counts.
+    quantity_intent = (
+        any(s in q for s in (
+            "quantity", "units sold", "number of units", "sum of qty",
+            "total qty", "total units", "how many units", "how many items",
+            "how many pieces", "total items", "total pieces", "units in total",
+        ))
+        or bool(re.search(r"\b(sum|total)\s+(?:of\s+)?(?:the\s+)?qty\b", q))
+    )
+    if quantity_intent:
+        return f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where}", params, "int"
+
+    # Generic order-count intent: "Count the refunded West orders".
     if (re.search(r"\b(count|counting|number of|how many)\b", q)
         or re.search(r"\btotal number of\b", q)):
         return f"SELECT COUNT(*) FROM orders WHERE {where}", params, "int"
 
     if any(s in q for s in (
-        "how many units", "total quantity", "total units", "quantity sold",
-        "units sold", "sum of qty", "total qty",
-    )):
-        return f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where}", params, "int"
-
-    if any(s in q for s in (
         "revenue", "earnings", "earned", "total sales", "sales in usd",
-        "total income", "generated", "total amount", "how much",
+        "total income", "generated", "total amount", "how much", "gross sales",
+        "total value", "sales revenue", "revenue generated",
     )):
         return (
             f"SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2) FROM orders WHERE {where}",
