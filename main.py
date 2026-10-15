@@ -1,27 +1,28 @@
+import json
+import logging
 import os
 import re
-import json
-import calendar
-import logging
-from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-
-# --------------------------------------------------
+# ============================================================
 # Configuration
-# --------------------------------------------------
+# ============================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-EMAIL = "24f1001102@ds.study.iitm.ac.in"
+BASE_DIR = Path(__file__).resolve().parent
+EXPORT_FILE = BASE_DIR / "export.ndjson"
+
+BUSINESS_TZ = ZoneInfo("Asia/Kolkata")
 
 DATA_URL = (
     "https://exam.sanand.workers.dev/questionData"
@@ -30,21 +31,13 @@ DATA_URL = (
 )
 
 QUESTION_ID = "q-ledger-agent-server"
-TIMEZONE = ZoneInfo("Asia/Kolkata")
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Acme-Ledger-Agent/1.0"})
+# ============================================================
+# API helpers
+# ============================================================
 
-ORDERS = []
-RATES = {}
-LAST_REFRESH = None
-
-
-# --------------------------------------------------
-# Load data
-# --------------------------------------------------
-
-def api_url(path):
+def api_url(path: str) -> str:
+    path = "/" + path.strip("/")
     return (
         DATA_URL
         + "&questionId="
@@ -54,472 +47,471 @@ def api_url(path):
     )
 
 
-def load_data():
-    """Load the ledger export and conversion rates."""
+def fetch_json(path: str):
+    response = requests.get(api_url(path), timeout=60)
+    response.raise_for_status()
+    return response.json()
 
-    global ORDERS, RATES, LAST_REFRESH
 
-    logger.info("Loading order ledger")
+def fetch_export():
+    response = requests.get(api_url("/export"), timeout=120)
+    response.raise_for_status()
 
-    # Load currency rates.
-    rate_response = SESSION.get(api_url("/rates"), timeout=10)
-    rate_response.raise_for_status()
+    rows = []
 
-    rate_data = rate_response.json()
-    RATES = {
-        currency: Decimal(str(rate))
-        for currency, rate in rate_data["usd_per_unit"].items()
-    }
-
-    # Load the complete NDJSON export.
-    export_response = SESSION.get(api_url("/export"), timeout=20)
-    export_response.raise_for_status()
-
-    records = []
-
-    for line in export_response.text.splitlines():
+    for line in response.text.splitlines():
         line = line.strip()
 
-        if not line:
-            continue
+        if line:
+            rows.append(json.loads(line))
 
-        records.append(json.loads(line))
-
-    # Keep the latest version of every order.
-    latest = {}
-
-    for row in records:
-        order_id = row["id"]
-
-        updated = parse_datetime(row["updated_at"])
-
-        if order_id not in latest:
-            latest[order_id] = row
-            continue
-
-        existing_updated = parse_datetime(
-            latest[order_id]["updated_at"]
-        )
-
-        if updated > existing_updated:
-            latest[order_id] = row
-
-    ORDERS = list(latest.values())
-    LAST_REFRESH = datetime.now(timezone.utc)
-
-    logger.info(
-        "Loaded %s records; %s unique orders",
-        len(records),
-        len(ORDERS),
-    )
+    return rows
 
 
-def parse_datetime(value):
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+# ============================================================
+# Date and numeric helpers
+# ============================================================
+
+def parse_datetime(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp, including timestamps ending in Z."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def business_datetime(value: str) -> datetime:
+    """Convert a timestamp to the Asia/Kolkata business timezone."""
+    dt = parse_datetime(value)
 
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TIMEZONE)
+        dt = dt.replace(tzinfo=BUSINESS_TZ)
 
-    return dt.astimezone(TIMEZONE)
-
-
-@asynccontextmanager
-async def lifespan(app):
-    load_data()
-    yield
+    return dt.astimezone(BUSINESS_TZ)
 
 
-app = FastAPI(
-    title="Acme Appliances Ledger Agent",
-    lifespan=lifespan,
-)
+def decimal_value(value) -> Decimal:
+    return Decimal(str(value))
 
 
-# --------------------------------------------------
-# Request model
-# --------------------------------------------------
-
-class QuestionRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
 
 
-# --------------------------------------------------
-# Money and filtering helpers
-# --------------------------------------------------
+# ============================================================
+# Ledger service
+# ============================================================
 
-def usd_amount(order):
-    currency = order["currency"]
+class Ledger:
+    def __init__(self):
+        self.rows = []
+        self.orders = []
+        self.rates = {}
+        self.last_refresh = None
 
-    if currency not in RATES:
-        raise ValueError(f"Unknown currency: {currency}")
+    def load(self):
+        """Load exchange rates and the latest version of every order."""
+        logger.info("Loading ledger data")
 
-    return (
-        Decimal(str(order["amount"])) * RATES[currency]
-    )
+        rates_data = fetch_json("/rates")
+        raw_rates = rates_data.get("usd_per_unit", {})
 
+        self.rates = {
+            currency.upper(): decimal_value(rate)
+            for currency, rate in raw_rates.items()
+        }
 
-def money(value):
-    return value.quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP,
-    )
+        raw_rows = fetch_export()
 
+        latest_by_id = {}
 
-def normalize(text):
-    return re.sub(r"\s+", " ", text.lower()).strip()
+        for row in raw_rows:
+            order_id = row.get("id")
 
+            if not order_id:
+                continue
 
-def extract_filters(question):
-    q = normalize(question)
+            updated_at = parse_datetime(row["updated_at"])
+            previous = latest_by_id.get(order_id)
 
-    filters = {}
+            if (
+                previous is None
+                or updated_at > parse_datetime(previous["updated_at"])
+            ):
+                latest_by_id[order_id] = row
 
-    # Regions.
-    regions = [
-        "North",
-        "South",
-        "East",
-        "West",
-        "Central",
-    ]
+        self.rows = raw_rows
+        self.orders = list(latest_by_id.values())
+        self.last_refresh = datetime.now(BUSINESS_TZ).isoformat()
 
-    for region in regions:
-        if re.search(
-            r"\b" + re.escape(region.lower()) + r"\b",
-            q,
-        ):
-            filters["region"] = region
-            break
+        logger.info(
+            "Loaded %d raw rows and %d current orders",
+            len(self.rows),
+            len(self.orders),
+        )
 
-    # Product names.
-    products = sorted(
-        {row["product"] for row in ORDERS},
-        key=len,
-        reverse=True,
-    )
+    def ensure_loaded(self):
+        if not self.orders or not self.rates:
+            self.load()
 
-    for product in products:
-        if product.lower() in q:
-            filters["product"] = product
-            break
+    def revenue_usd(self, order) -> Decimal:
+        currency = str(order["currency"]).upper()
 
-    # Customer identifiers.
-    customer_match = re.search(
-        r"\bc\d{4}\b",
-        q,
-        re.IGNORECASE,
-    )
+        if currency not in self.rates:
+            raise ValueError(f"Unknown currency: {currency}")
 
-    if customer_match:
-        filters["customer"] = customer_match.group().upper()
+        return decimal_value(order["amount"]) * self.rates[currency]
 
-    # Currency filters.
-    currency_match = re.search(
-        r"\b(USD|EUR|INR)\b",
-        question,
-        re.IGNORECASE,
-    )
-
-    if currency_match:
-        filters["currency"] = currency_match.group().upper()
-
-    # Month and year.
-    months = {
-        name.lower(): number
-        for number, name in enumerate(calendar.month_name)
-        if name
-    }
-
-    for month_name, month_number in months.items():
-        if re.search(r"\b" + month_name + r"\b", q):
-            filters["month"] = month_number
-            break
-
-    year_match = re.search(r"\b(20\d{2})\b", q)
-
-    if year_match:
-        filters["year"] = int(year_match.group())
-
-    # Explicit date range.
-    date_match = re.search(
-        r"\bbetween\s+"
-        r"(\d{4}-\d{2}-\d{2})"
-        r"\s+and\s+"
-        r"(\d{4}-\d{2}-\d{2})\b",
-        q,
-    )
-
-    if date_match:
-        filters["start_date"] = datetime.fromisoformat(
-            date_match.group(1)
-        ).date()
-
-        filters["end_date"] = datetime.fromisoformat(
-            date_match.group(2)
-        ).date()
-
-    return filters
-
-
-def filter_orders(orders, question, statuses=None):
-    filters = extract_filters(question)
-    q = normalize(question)
-
-    # Determine the date field.
-    date_field = "created_at"
-
-    if any(
-        word in q
-        for word in [
-            "updated",
-            "last updated",
-            "status changed",
-        ]
+    def filter_orders(
+        self,
+        *,
+        year=None,
+        month=None,
+        region=None,
+        product=None,
+        customer=None,
+        status="paid",
+        date_field="created_at",
     ):
-        date_field = "updated_at"
+        """
+        Filter current orders.
 
-    selected = []
+        Revenue calculations use current order versions, paid status,
+        and business-local timestamps.
+        """
+        self.ensure_loaded()
 
-    for order in orders:
-        if statuses and order["status"] not in statuses:
-            continue
+        result = []
 
-        if "region" in filters:
-            if order["region"].lower() != filters["region"].lower():
+        for order in self.orders:
+            if status is not None:
+                if str(order.get("status", "")).lower() != status.lower():
+                    continue
+
+            if region is not None:
+                if normalize_text(str(order.get("region", ""))) != normalize_text(region):
+                    continue
+
+            if product is not None:
+                if normalize_text(str(order.get("product", ""))) != normalize_text(product):
+                    continue
+
+            if customer is not None:
+                if normalize_text(str(order.get("customer", ""))) != normalize_text(customer):
+                    continue
+
+            dt = business_datetime(order[date_field])
+
+            if year is not None and dt.year != year:
                 continue
 
-        if "product" in filters:
-            if order["product"].lower() != filters["product"].lower():
+            if month is not None and dt.month != month:
                 continue
 
-        if "customer" in filters:
-            if order["customer"].upper() != filters["customer"]:
-                continue
-
-        if "currency" in filters:
-            if order["currency"].upper() != filters["currency"]:
-                continue
-
-        dt = parse_datetime(order[date_field])
-        order_date = dt.date()
-
-        if "year" in filters and dt.year != filters["year"]:
-            continue
-
-        if "month" in filters and dt.month != filters["month"]:
-            continue
-
-        if "start_date" in filters:
-            if order_date < filters["start_date"]:
-                continue
-
-        if "end_date" in filters:
-            if order_date > filters["end_date"]:
-                continue
-
-        selected.append(order)
-
-    return selected
-
-
-# --------------------------------------------------
-# Question interpretation
-# --------------------------------------------------
-
-def answer_question(question):
-    q = normalize(question)
-
-    if not ORDERS:
-        raise ValueError("The order ledger is empty")
-
-    # Status-specific questions.
-    asks_refunds = any(
-        word in q
-        for word in [
-            "refund",
-            "refunded",
-            "refunds",
-        ]
-    )
-
-    asks_void = any(
-        word in q
-        for word in [
-            "void",
-            "voided",
-            "cancelled",
-            "canceled",
-        ]
-    )
-
-    if asks_refunds:
-        statuses = {"refunded"}
-    elif asks_void:
-        statuses = {"void"}
-    else:
-        statuses = {"paid"}
-
-    selected = filter_orders(
-        ORDERS,
-        question,
-        statuses=statuses,
-    )
-
-    if not selected:
-        if any(
-            word in q
-            for word in [
-                "product",
-                "customer",
-                "which",
-                "highest",
-                "lowest",
-                "most",
-                "least",
-            ]
-        ):
-            return ""
-
-        return 0
-
-    # Count orders.
-    asks_count = any(
-        phrase in q
-        for phrase in [
-            "how many orders",
-            "number of orders",
-            "count of orders",
-            "order count",
-            "how many refunds",
-            "number of refunds",
-            "count of refunds",
-            "how many customers",
-            "number of customers",
-            "unique customers",
-        ]
-    )
-
-    if asks_count:
-        if "customer" in q:
-            return len({row["customer"] for row in selected})
-
-        return len(selected)
-
-    # Quantity questions.
-    if any(
-        phrase in q
-        for phrase in [
-            "units sold",
-            "total units",
-            "quantity sold",
-            "total quantity",
-            "how many units",
-            "number of units",
-        ]
-    ):
-        return sum(int(row["qty"]) for row in selected)
-
-    # Ranking questions.
-    asks_ranking = any(
-        word in q
-        for word in [
-            "highest",
-            "lowest",
-            "most",
-            "least",
-            "top",
-            "best",
-            "largest",
-            "smallest",
-        ]
-    )
-
-    if asks_ranking:
-        if "customer" in q:
-            group_field = "customer"
-        elif "region" in q:
-            group_field = "region"
-        else:
-            group_field = "product"
-
-        totals = defaultdict(Decimal)
-
-        for row in selected:
-            totals[row[group_field]] += usd_amount(row)
-
-        if not totals:
-            return ""
-
-        if any(
-            word in q
-            for word in [
-                "lowest",
-                "least",
-                "smallest",
-            ]
-        ):
-            result = min(totals, key=totals.get)
-        else:
-            result = max(totals, key=totals.get)
+            result.append(order)
 
         return result
 
-    # Product/customer/region listing questions.
-    if any(
-        phrase in q
-        for phrase in [
-            "which product",
-            "what product",
-            "which customer",
-            "what customer",
-            "which region",
-            "what region",
-        ]
-    ) and not asks_ranking:
-        if "customer" in q:
-            field = "customer"
-        elif "region" in q:
-            field = "region"
-        else:
-            field = "product"
+    def total_revenue(self, orders) -> Decimal:
+        return sum(
+            (self.revenue_usd(order) for order in orders),
+            Decimal("0"),
+        )
 
-        values = sorted({row[field] for row in selected})
+    def revenue_by(self, orders, field):
+        totals = defaultdict(lambda: Decimal("0"))
 
-        return values[0] if len(values) == 1 else values
+        for order in orders:
+            key = order.get(field)
 
-    # Financial totals.
-    total = sum(
-        (usd_amount(row) for row in selected),
-        Decimal("0"),
+            if key is not None:
+                totals[str(key)] += self.revenue_usd(order)
+
+        return dict(totals)
+
+    def count_by(self, orders, field):
+        counts = defaultdict(int)
+
+        for order in orders:
+            key = order.get(field)
+
+            if key is not None:
+                counts[str(key)] += 1
+
+        return dict(counts)
+
+
+ledger = Ledger()
+
+# ============================================================
+# Question parsing
+# ============================================================
+
+MONTHS = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
+
+def extract_period(question):
+    q = normalize_text(question)
+
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    year = int(year_match.group(1)) if year_match else None
+
+    month = None
+
+    for month_name, month_number in MONTHS.items():
+        if re.search(r"\b" + re.escape(month_name) + r"\b", q):
+            month = month_number
+            break
+
+    return year, month
+
+
+def extract_region(question):
+    q = normalize_text(question)
+
+    regions = ["central", "north", "south", "east", "west"]
+
+    for region in regions:
+        if re.search(r"\b" + region + r"\b", q):
+            return region.title()
+
+    return None
+
+
+def extract_product(question):
+    q = normalize_text(question)
+
+    products = [
+        "Rice Cooker",
+        "Air Fryer",
+        "Kettle",
+        "Mixer",
+        "Toaster",
+        "Grinder",
+        "Blender",
+        "Juicer",
+    ]
+
+    for product in products:
+        if normalize_text(product) in q:
+            return product
+
+    return None
+
+
+def extract_customer(question):
+    match = re.search(r"\bC\d{4}\b", question, re.IGNORECASE)
+    return match.group(0).upper() if match else None
+
+
+def money(value):
+    return value.quantize(Decimal("0.01"))
+
+
+# ============================================================
+# Answer generation
+# ============================================================
+
+def answer_question(question: str):
+    q = normalize_text(question)
+
+    ledger.ensure_loaded()
+
+    year, month = extract_period(question)
+    region = extract_region(question)
+    product = extract_product(question)
+    customer = extract_customer(question)
+
+    # The service notes define revenue as paid orders only.
+    orders = ledger.filter_orders(
+        year=year,
+        month=month,
+        region=region,
+        product=product,
+        customer=customer,
+        status="paid",
+        date_field="created_at",
     )
 
-    return float(money(total))
+    # --------------------------------------------------------
+    # Total revenue
+    # --------------------------------------------------------
+
+    if "revenue" in q or "sales" in q:
+        if any(word in q for word in ["which product", "top product", "most", "highest"]):
+            totals = ledger.revenue_by(orders, "product")
+
+            if not totals:
+                return "No matching paid orders found."
+
+            winner = max(totals, key=totals.get)
+            return winner
+
+        if any(word in q for word in ["which region", "top region"]):
+            totals = ledger.revenue_by(orders, "region")
+
+            if not totals:
+                return "No matching paid orders found."
+
+            return max(totals, key=totals.get)
+
+        if any(word in q for word in ["which customer", "top customer"]):
+            totals = ledger.revenue_by(orders, "customer")
+
+            if not totals:
+                return "No matching paid orders found."
+
+            return max(totals, key=totals.get)
+
+        return str(money(ledger.total_revenue(orders)))
+
+    # --------------------------------------------------------
+    # Order counts
+    # --------------------------------------------------------
+
+    if any(word in q for word in ["how many", "number of orders", "count of orders"]):
+        return str(len(orders))
+
+    # --------------------------------------------------------
+    # Quantity questions
+    # --------------------------------------------------------
+
+    if "quantity" in q or "units sold" in q or "how many units" in q:
+        total_qty = sum(int(order.get("qty", 0)) for order in orders)
+        return str(total_qty)
+
+    # --------------------------------------------------------
+    # Average order value
+    # --------------------------------------------------------
+
+    if "average order value" in q or "average revenue per order" in q:
+        if not orders:
+            return "0.00"
+
+        average = ledger.total_revenue(orders) / Decimal(len(orders))
+        return str(money(average))
+
+    # --------------------------------------------------------
+    # Status counts
+    # --------------------------------------------------------
+
+    if "refunded" in q or "void" in q:
+        requested_status = (
+            "refunded" if "refunded" in q else "void"
+        )
+
+        status_orders = ledger.filter_orders(
+            year=year,
+            month=month,
+            region=region,
+            product=product,
+            customer=customer,
+            status=requested_status,
+            date_field="created_at",
+        )
+
+        return str(len(status_orders))
+
+    # --------------------------------------------------------
+    # Most common product
+    # --------------------------------------------------------
+
+    if any(word in q for word in ["most ordered product", "most popular product"]):
+        counts = ledger.count_by(orders, "product")
+
+        if not counts:
+            return "No matching orders found."
+
+        return max(counts, key=counts.get)
+
+    # --------------------------------------------------------
+    # Fallback
+    # --------------------------------------------------------
+
+    raise ValueError(
+        "I could not determine how to answer this question: " + question
+    )
 
 
-# --------------------------------------------------
-# HTTP endpoint
-# --------------------------------------------------
+# ============================================================
+# FastAPI application
+# ============================================================
+
+app = FastAPI(
+    title="Acme Appliances Order Ledger",
+    version="1.0.0",
+)
+
+
+class QuestionRequest(BaseModel):
+    question: str
+
+
+@app.on_event("startup")
+def startup_event():
+    try:
+        ledger.load()
+    except Exception:
+        logger.exception("Initial ledger loading failed")
+
 
 @app.get("/")
 def root():
     return {
-        "service": "Acme Appliances Ledger Agent",
-        "status": "ready",
-        "endpoint": "/answer",
+        "service": "Acme Appliances order ledger",
+        "status": "running",
     }
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "orders_loaded": len(ORDERS),
-        "last_refresh": (
-            LAST_REFRESH.isoformat()
-            if LAST_REFRESH
-            else None
-        ),
+        "status": "ok" if ledger.orders else "not_loaded",
+        "orders_loaded": len(ledger.orders),
+        "last_refresh": ledger.last_refresh,
     }
+
+
+@app.post("/refresh")
+def refresh():
+    try:
+        ledger.load()
+
+        return {
+            "status": "ok",
+            "raw_rows": len(ledger.rows),
+            "orders_loaded": len(ledger.orders),
+            "last_refresh": ledger.last_refresh,
+        }
+
+    except Exception:
+        logger.exception("Ledger refresh failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to refresh ledger",
+        )
 
 
 @app.post("/answer")
@@ -534,8 +526,14 @@ def answer(request: QuestionRequest):
 
     try:
         result = answer_question(question)
-
         return {"answer": result}
+
+    except ValueError as exc:
+        logger.warning("Question parsing failed: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
 
     except Exception:
         logger.exception("Failed to answer question")
