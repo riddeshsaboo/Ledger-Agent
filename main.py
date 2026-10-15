@@ -215,6 +215,24 @@ def make_plan(question):
             params, "string"
         )
 
+    # Average-value intent must be checked BEFORE generic "how many".
+    # Example: "On average, how many US dollars is a paid South order worth?"
+    # asks for AVG(amount_usd), not COUNT(*).
+    average_intent = (
+        "average" in q
+        or "on average" in q
+        or "mean" in q
+        or "worth" in q
+        or bool(re.search(r"\bavg\b", q))
+        or bool(re.search(r"\b(per|each)\s+order\b", q))
+    )
+    if average_intent:
+        sql = (
+            f"SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) "
+            f"FROM orders WHERE {where}"
+        )
+        return sql, params, "money"
+
     # Distinct-customer questions must be checked before generic counts.
     if (re.search(r"\b(unique|distinct|different)\s+customers?\b", q)
         or re.search(r"\bhow many customers?\b", q)
@@ -222,7 +240,8 @@ def make_plan(question):
         or re.search(r"\bnumber of customers?\b", q)):
         return f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where}", params, "int"
 
-    # Count intent comes before revenue fallback: handles "Count the refunded West orders".
+    # Count intent: "how many" means a count only when it is not an
+    # average/value question. This handles "Count the refunded West orders".
     if (re.search(r"\b(count|counting|number of|how many)\b", q)
         or re.search(r"\btotal number of\b", q)):
         return f"SELECT COUNT(*) FROM orders WHERE {where}", params, "int"
@@ -232,12 +251,6 @@ def make_plan(question):
         "units sold", "sum of qty", "total qty",
     )):
         return f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where}", params, "int"
-
-    if "average" in q or "mean" in q or re.search(r"\bavg\b", q):
-        return (
-            f"SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) FROM orders WHERE {where}",
-            params, "money"
-        )
 
     if any(s in q for s in (
         "revenue", "earnings", "earned", "total sales", "sales in usd",
